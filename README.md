@@ -27,6 +27,13 @@ All deletion operates on GPT tokens (via `tiktoken`). Severity `n` is the fracti
 
 ## Results
 
+> **These are the v1 results from the paper draft, produced by the original code.** That code had three known problems:
+> - The model ran at its default temperature, so results varied from run to run.
+> - Sentences that met at a `<br />` paragraph break were treated as one sentence (this affected 52% of the reviews).
+> - The sentence-based policies did not delete the stated fraction: about 5 points too little for SB Frontal and about 2 too much for SB Rear.
+>
+> The code is now fixed (v2). The v1 data is kept unchanged in [`archive/v1/`](archive/v1/). Rerun the experiment to produce v2 results (see [Reproducing](#reproducing)).
+
 There are 500 reviews (the same 500 at every policy/severity combination), sampled from the IMDb test split with seed 42. Each cell shows accuracy.
 
 | Severity | Random | Frontal | Rear | SB Frontal | SB Rear | Length-Adaptive* |
@@ -43,9 +50,9 @@ There are 500 reviews (the same 500 at every policy/severity combination), sampl
 
 \*Length-Adaptive is an experimental candidate for RQ3. Its 180-token threshold was chosen by exploring these same 500 reviews, so these numbers are in-sample. It still needs to be evaluated on held-out reviews.
 
-![Accuracy vs. deletion level](results/results.png)
+![Accuracy vs. deletion level (v1)](archive/v1/results/results.png)
 
-Per-severity plots of accuracy against original review length are in [`results/plots/`](results/plots/).
+Per-severity plots of accuracy against original review length are in [`archive/v1/results/plots/`](archive/v1/results/plots/).
 
 ## Repository layout
 
@@ -56,33 +63,32 @@ Per-severity plots of accuracy against original review length are in [`results/p
 ├── paper/
 │   └── research_draft.pdf   # current paper draft
 ├── data/
-│   ├── run_records.csv      # every individual classification (27,000 rows)
-│   └── dataset_summary.txt  # IMDb test-set class balance and token-length stats
-└── results/
-    ├── results.txt          # accuracy table (all policies × severities)
-    ├── results.png          # accuracy vs. severity plot
-    └── plots/               # accuracy vs. review length, one plot per severity
+│   ├── dataset_summary.txt  # IMDb test-set class balance and token-length stats
+│   └── run_records.csv      # every individual classification (created by a run)
+├── results/                 # created by a run
+│   ├── results.txt          # accuracy table (all policies × severities)
+│   ├── results.png          # accuracy vs. severity plot
+│   └── plots/               # accuracy vs. review length, one plot per severity
+└── archive/v1/              # original run behind the paper draft's numbers
+    ├── run_records.csv      # 27,000 rows
+    └── results/
 ```
 
-`data/run_records.csv` columns: `index` (row in the IMDb test split), `true_label`, `pred_label` (1 = positive, 0 = negative, -1 = unparsable), `correct`, `orig_length` and `degraded_length` (in tokens), `level`, `policy`, and `policy_label`.
+`run_records.csv` columns: `index` (row in the IMDb test split), `true_label`, `pred_label` (1 = positive, 0 = negative, -1 = unparsable), `correct`, `orig_length` and `degraded_length` (in tokens), `level`, `policy`, `policy_label`, and `version` (v2 only).
 
 ## Reproducing
 
 ```bash
 pip install -r requirements.txt
+cp .env.example .env   # then set OPENAI_API_KEY=sk-... in .env (gitignored, never committed)
 python run_experiment.py
 ```
 
-The script reuses `data/run_records.csv`. It only calls the API for policies not already recorded there, using the same review sample. With the committed data, every policy is already present, so the command regenerates all tables and plots **without an API key or any API calls**.
+A full run makes up to 27,000 calls to `gpt-4.1-mini` at temperature 0. Identical inputs are cached, so there are somewhat fewer actual calls. The run saves `data/run_records.csv` after every level/policy block. If it is interrupted, run the same command again and it will continue where it stopped. Once every block is recorded, rerunning only regenerates the tables and plots, with no API calls.
 
-To run a new policy, add it to `DELETION_METHODS` / `POLICY_LABELS` and put your key in a local `.env` file. The `.env` file is gitignored, so it is never committed.
+To add a policy, add it to `DELETION_METHODS` / `POLICY_LABELS` and rerun. Only the new blocks call the API. If you change anything that alters the text sent to the model, bump `EXPERIMENT_VERSION` and move the old `data/run_records.csv` aside. The script will refuse to mix records from different versions.
 
-```bash
-cp .env.example .env   # then set OPENAI_API_KEY=sk-... in .env
-python run_experiment.py
-```
-
-To rerun everything from scratch, move `data/run_records.csv` aside first. That run makes about 27,000 API calls. Note that the model is called at its default temperature, so a rerun will not reproduce the numbers exactly.
+All policies remove `round(n × review tokens)` tokens, so every policy is compared at the same deletion budget.
 
 ## Related work
 

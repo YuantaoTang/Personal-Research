@@ -11,9 +11,10 @@ is the work-in-progress candidate for the optimal policy (RQ3):
     1. Random Deletion             - remove a random selection of tokens
     2. Frontal Deletion            - drop the front n fraction of tokens
     3. Rear Deletion                - drop the back n fraction of tokens
-    4. Sentence-based Frontal Deletion - split into sentences (by punctuation),
-                                          drop the front n fraction of EACH
-                                          sentence's tokens
+    4. Sentence-based Frontal Deletion - split into sentences (by punctuation
+                                          and <br /> line breaks), drop the
+                                          front n fraction of EACH sentence's
+                                          tokens
     5. Sentence-based Rear Deletion    - same, but drop the back n fraction
                                           of each sentence
     6. Length-Adaptive Deletion       - rear deletion for reviews of at most
@@ -22,7 +23,12 @@ is the work-in-progress candidate for the optimal policy (RQ3):
 
 All deletion happens on the tokenized form (GPT token ids via tiktoken);
 text is detokenized back to a normal string before being sent to the
-Chat Completions API.
+Chat Completions API. Every policy removes round(n * len(tokens)) tokens
+from a review, so policies are compared at equal deletion budgets.
+
+Records in data/run_records.csv are tagged with EXPERIMENT_VERSION. A rerun
+resumes from any (level, policy) blocks already recorded under the current
+version and refuses to mix in records from an older version.
 
 Outputs, all written relative to the working directory:
     results/results.png     - accuracy vs. deletion level, all policies
@@ -60,8 +66,16 @@ from sklearn.metrics import accuracy_score
 # Configuration
 # --------------------------------------------------------------------------- #
 
+# Bump whenever a change would alter the text sent to the model or how it is
+# classified, so records produced by older code are never reused.
+#   v1: original run (paper draft numbers; archived in archive/v1/)
+#   v2: temperature 0, <br />-aware sentence splitting, exact deletion budgets
+EXPERIMENT_VERSION = 2
+
 RANDOM_SEED = 42
 MODEL_NAME = "gpt-4.1-mini"
+TEMPERATURE = 0.0
+MAX_API_RETRIES = 5
 SAMPLE_SIZE = 500
 NOISE_LEVELS = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
 PROGRESS_LOG_EVERY = 50  # log a progress line every N samples within a policy
@@ -126,13 +140,44 @@ def compute_token_lengths(texts: pd.Series) -> pd.Series:
     return pd.Series(lengths, index=texts.index, name="orig_length")
 
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+# A sentence boundary is either whitespace after '.', '!' or '?', or a run of
+# HTML line breaks. IMDB reviews mark paragraphs with "<br /><br />", often
+# directly after the punctuation ("...end.<br /><br />Next..."), so splitting
+# on punctuation + whitespace alone merges sentences across paragraphs.
+_SENTENCE_SEPARATOR_RE = re.compile(r"((?<=[.!?])\s+|\s*(?:<br\s*/?>\s*)+)", re.IGNORECASE)
+
+
+def split_sentences_with_separators(text: str) -> tuple[list[str], list[str]]:
+    """
+    Split text into sentences and the separators between them, such that
+    ``separators[0] + sentences[0] + separators[1] + sentences[1] + ...``
+    (with ``len(separators) == len(sentences) + 1``) reproduces `text` exactly.
+    Separators (whitespace and <br /> tags) are kept so the sentence-based
+    policies preserve the review's paragraph layout like the other policies.
+    """
+    parts = _SENTENCE_SEPARATOR_RE.split(text)
+    sentences: list[str] = []
+    separators: list[str] = [""]
+    for i, part in enumerate(parts):
+        if i % 2 == 1:  # separator
+            separators[-1] += part
+        elif part:      # non-empty sentence
+            sentences.append(part)
+            separators.append("")
+    return sentences, separators
 
 
 def split_sentences(text: str) -> list[str]:
-    """Split text into sentences on '.', '!', or '?' followed by whitespace."""
-    sentences = _SENTENCE_SPLIT_RE.split(text.strip())
-    return [s for s in sentences if s]
+    """Split text into sentences on '.', '!', '?' + whitespace, or <br /> breaks."""
+    return split_sentences_with_separators(text)[0]
+
+
+def deletion_count(num_tokens: int, n: float) -> int:
+    """Number of tokens every policy removes from a `num_tokens`-token review at
+    level `n`: round(n * num_tokens), always leaving at least one token."""
+    if num_tokens <= 1:
+        return 0
+    return min(num_tokens - 1, int(round(num_tokens * n)))
 
 
 # --------------------------------------------------------------------------- #
@@ -144,91 +189,109 @@ def random_deletion(text: str, n: float) -> str:
     Random Deletion: remove a random selection of exactly round(n * len(tokens))
     tokens (sampled without replacement), rather than flipping an independent
     coin per token. This makes the removed fraction deterministic instead of
-    binomially distributed, matching the other four policies' exactness.
+    binomially distributed, matching the other policies' exactness.
     """
     tokens = tokenize(text)
     num_tokens = len(tokens)
-    if num_tokens == 0:
-        return text
-
-    num_to_remove = min(num_tokens - 1, int(round(num_tokens * n)))
+    num_to_remove = deletion_count(num_tokens, n)
     if num_to_remove <= 0:
         return text
 
     remove_indices = set(np.random.choice(num_tokens, size=num_to_remove, replace=False))
     kept = [t for i, t in enumerate(tokens) if i not in remove_indices]
-    if not kept:
-        kept = [tokens[np.random.randint(num_tokens)]]
-
     return detokenize(kept)
 
 
 def frontal_deletion(text: str, n: float) -> str:
     """Frontal Deletion: drop the front n fraction of tokens; keep the tail."""
     tokens = tokenize(text)
-    if not tokens:
+    drop_len = deletion_count(len(tokens), n)
+    if drop_len <= 0:
         return text
-
-    drop_len = min(len(tokens) - 1, int(len(tokens) * n))
     return detokenize(tokens[drop_len:])
 
 
 def rear_deletion(text: str, n: float) -> str:
     """Rear Deletion: drop the back n fraction of tokens; keep the front."""
     tokens = tokenize(text)
-    if not tokens:
+    drop_len = deletion_count(len(tokens), n)
+    if drop_len <= 0:
+        return text
+    return detokenize(tokens[: len(tokens) - drop_len])
+
+
+def allocate_sentence_deletions(sentence_lengths: list[int], total: int) -> list[int]:
+    """
+    Split a deletion budget of `total` tokens across sentences in proportion to
+    their lengths (largest-remainder rounding), so each sentence loses as close
+    to the same fraction as possible while the review as a whole loses exactly
+    `total` tokens. Flooring per sentence instead would systematically delete
+    less than the target from reviews with many short sentences.
+    """
+    num_tokens = sum(sentence_lengths)
+    if total <= 0 or num_tokens == 0:
+        return [0] * len(sentence_lengths)
+    total = min(total, num_tokens - 1)
+
+    quotas = [length * total / num_tokens for length in sentence_lengths]
+    counts = [int(q) for q in quotas]
+    remainder = total - sum(counts)
+    # Hand the leftover tokens to the sentences with the largest fractional
+    # parts (ties broken by position, for determinism).
+    order = sorted(range(len(quotas)), key=lambda i: (counts[i] - quotas[i], i))
+    for i in order[:remainder]:
+        counts[i] += 1
+    return counts
+
+
+def _sentence_deletion(text: str, n: float, from_front: bool) -> str:
+    """Shared implementation of the two sentence-based policies."""
+    sentences, separators = split_sentences_with_separators(text)
+    if not sentences:
         return text
 
-    keep_len = max(1, int(len(tokens) * (1 - n)))
-    return detokenize(tokens[:keep_len])
+    sentence_tokens = [tokenize(s) for s in sentences]
+    # Budget is based on the whole review's token count, like every other
+    # policy; only the sentence text itself is eligible for deletion.
+    budget = deletion_count(len(tokenize(text)), n)
+    drops = allocate_sentence_deletions([len(t) for t in sentence_tokens], budget)
+
+    pieces = [separators[0]]
+    for tokens, drop, separator in zip(sentence_tokens, drops, separators[1:]):
+        kept = tokens[drop:] if from_front else tokens[: len(tokens) - drop]
+        if kept:  # a sentence deleted entirely also drops its trailing separator
+            piece = detokenize(kept)
+            if not pieces[-1] or pieces[-1][-1].isspace():
+                # A sentence's tail starts with a space-prefixed token (" waste");
+                # after a whitespace separator that would leave a double space,
+                # which tokenizes as an extra token.
+                piece = piece.lstrip()
+            pieces.append(piece)
+            pieces.append(separator)
+    return "".join(pieces).strip() or text
 
 
 def sentence_frontal_deletion(text: str, n: float) -> str:
     """
-    Sentence-based Frontal Deletion: split into sentences on punctuation,
-    then drop the front n fraction of EACH sentence's tokens. Deletion is
+    Sentence-based Frontal Deletion: split into sentences on punctuation and
+    <br /> line breaks, then drop the front n fraction of EACH sentence's tokens. Deletion is
     applied per-sentence (rather than to the whole review at once) so that
     roughly n fraction of every sentence is removed, not just the opening
-    sentence(s).
+    sentence(s). The review as a whole loses the same number of tokens as
+    under the other policies (see allocate_sentence_deletions).
     """
-    sentences = split_sentences(text)
-    if not sentences:
-        return text
-
-    kept_sentences = []
-    for sentence in sentences:
-        tokens = tokenize(sentence)
-        if not tokens:
-            continue
-        drop_len = min(len(tokens) - 1, int(len(tokens) * n)) if len(tokens) > 1 else 0
-        kept = tokens[drop_len:]
-        if kept:
-            kept_sentences.append(detokenize(kept))
-
-    return " ".join(kept_sentences) if kept_sentences else text
+    return _sentence_deletion(text, n, from_front=True)
 
 
 def sentence_rear_deletion(text: str, n: float) -> str:
     """Sentence-based Rear Deletion: like sentence_frontal_deletion, but
     drops the back n fraction of each sentence's tokens instead of the front."""
-    sentences = split_sentences(text)
-    if not sentences:
-        return text
-
-    kept_sentences = []
-    for sentence in sentences:
-        tokens = tokenize(sentence)
-        if not tokens:
-            continue
-        keep_len = max(1, int(len(tokens) * (1 - n)))
-        kept = tokens[:keep_len]
-        if kept:
-            kept_sentences.append(detokenize(kept))
-
-    return " ".join(kept_sentences) if kept_sentences else text
+    return _sentence_deletion(text, n, from_front=False)
 
 
-LENGTH_ADAPTIVE_THRESHOLD = 180  # tokens; see analysis in run_records.csv exploration
+# Tokens. Chosen by exploring the v1 run's records, i.e. on the same 500 reviews
+# it is evaluated on, so its accuracy here is in-sample (see README).
+LENGTH_ADAPTIVE_THRESHOLD = 180
 
 
 def length_adaptive_deletion(text: str, n: float, threshold: int = LENGTH_ADAPTIVE_THRESHOLD) -> str:
@@ -272,6 +335,9 @@ def apply_deletion(df: pd.DataFrame, n: float, method: str) -> pd.DataFrame:
     if method not in DELETION_METHODS:
         raise ValueError(f"Unknown deletion method: {method!r}")
 
+    # Reseed so random_deletion's choices depend only on (level, review), not
+    # on which other policies happened to run earlier in this session.
+    np.random.seed(RANDOM_SEED)
     df = df.copy()
     fn = DELETION_METHODS[method]
     df["text"] = df["text"].apply(lambda x: fn(x, n))
@@ -358,12 +424,13 @@ class SentimentClassifier:
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=5,
+            temperature=TEMPERATURE,
         )
 
         if self.on_call:
             self.on_call()
 
-        result = response.choices[0].message.content.strip()
+        result = (response.choices[0].message.content or "").strip()
         self._cache[text] = result
         return result
 
@@ -378,22 +445,17 @@ class SentimentClassifier:
 
 
 def evaluate(
-    df: pd.DataFrame,
+    sample: pd.DataFrame,
     classifier: SentimentClassifier,
-    sample_size: int = 100,
     tracker: ProgressTracker | None = None,
     context: str = "",
     log_every: int = PROGRESS_LOG_EVERY,
     orig_lengths: pd.Series | None = None,
-    indices: list | None = None,
 ) -> tuple[float, pd.DataFrame]:
     """
-    Classify a sample of rows from `df` and return (accuracy, records).
-
-    By default, samples `sample_size` rows via `df.sample(random_state=RANDOM_SEED)`.
-    If `indices` is given instead, those exact rows are used (via `df.loc[indices]`)
-    rather than drawing a new sample -- this is how a re-run can reuse the exact
-    same reviews an earlier run already classified.
+    Classify every row of `sample` (the already-degraded review sample) and
+    return (accuracy, records). Unparsable model outputs are excluded from
+    the accuracy and recorded with pred_label=-1 and correct=NaN.
 
     `records` is a DataFrame with one row per sampled review: its original
     index, true/predicted label, whether the prediction was correct, and
@@ -401,10 +463,6 @@ def evaluate(
     `orig_lengths`, if given, should be a Series mapping df's index to the
     token length of the UNDEGRADED review (see compute_token_lengths).
     """
-    if indices is not None:
-        sample = df.loc[indices]
-    else:
-        sample = df.sample(n=sample_size, random_state=RANDOM_SEED)
     actual_size = len(sample)
 
     preds, truths = [], []
@@ -432,7 +490,7 @@ def evaluate(
         if tracker and (i % log_every == 0 or i == actual_size):
             tracker.log_progress(context=f"{context} | {i}/{actual_size} samples")
 
-    accuracy = accuracy_score(truths, preds)
+    accuracy = accuracy_score(truths, preds) if preds else float("nan")
     return accuracy, pd.DataFrame(records)
 
 
@@ -477,75 +535,81 @@ _POLICY_TO_RESULTS_FIELD: dict[str, str] = {
 }
 
 
+def completed_blocks(records: pd.DataFrame | None) -> set[tuple[float, str]]:
+    """(level, policy) pairs that already have a full sample's worth of records."""
+    if records is None or records.empty:
+        return set()
+    counts = records.groupby(["level", "policy"]).size()
+    return {(round(float(level), 1), policy) for (level, policy), c in counts.items() if c >= SAMPLE_SIZE}
+
+
 def run_experiment(
-    test_df: pd.DataFrame,
+    sample_df: pd.DataFrame,
     classifier: SentimentClassifier,
     orig_lengths: pd.Series,
-    policies: list[str] | None = None,
-    indices_by_level: dict[float, list] | None = None,
+    existing_records: pd.DataFrame | None = None,
+    on_block_done: Callable[[pd.DataFrame], None] | None = None,
 ) -> pd.DataFrame:
     """
-    For each level n in NOISE_LEVELS, evaluate the given deletion policies
-    (default: all of DELETION_METHODS) at that deletion fraction.
+    For each level n in NOISE_LEVELS and each policy in DELETION_METHODS,
+    degrade every review in `sample_df` and classify it.
 
-    `policies` lets you run only a subset (e.g. just a newly added policy),
-    and `indices_by_level` lets you reuse the exact review sample an earlier
-    run already used for each level instead of drawing a fresh one -- pass
-    both together to extend a previous run's results.csv without repeating
-    any already-computed policy's API calls.
+    (level, policy) blocks already present in `existing_records` are skipped,
+    so a run that crashed or was interrupted resumes where it stopped, and a
+    newly added policy only costs API calls for that policy. After each block,
+    the combined records so far are passed to `on_block_done` (used to
+    checkpoint data/run_records.csv).
 
-    Returns a DataFrame with one row per individual classification made
-    (used for the length-vs-accuracy plots and the raw-data export, and to
-    build the aggregate ExperimentResults via build_experiment_results()).
+    Returns a DataFrame with one row per individual classification (existing
+    plus new), used for the plots, the raw-data export, and to build the
+    aggregate ExperimentResults via build_experiment_results().
     """
-    policies = policies or list(DELETION_METHODS.keys())
+    done = completed_blocks(existing_records)
+    todo = [(n, key) for n in NOISE_LEVELS for key in DELETION_METHODS if (round(n, 1), key) not in done]
     all_records: list[pd.DataFrame] = []
+    if existing_records is not None and not existing_records.empty:
+        all_records.append(existing_records)
 
-    total_calls_estimate = len(NOISE_LEVELS) * len(policies) * SAMPLE_SIZE
+    if not todo:
+        logger.info("All level/policy blocks already recorded -- skipping API calls entirely")
+        return pd.concat(all_records, ignore_index=True)
+
+    total_calls_estimate = len(todo) * len(sample_df)
     tracker = ProgressTracker(total_calls_estimate)
     classifier.on_call = tracker.record_call  # wire real (non-cached) API calls into the tracker
     logger.info(
-        "Starting experiment: %d levels x %d policies x %d samples "
+        "Starting experiment: %d of %d level/policy blocks to run x %d samples "
         "(up to %d API calls, fewer if caching kicks in)",
-        len(NOISE_LEVELS),
-        len(policies),
-        SAMPLE_SIZE,
+        len(todo),
+        len(NOISE_LEVELS) * len(DELETION_METHODS),
+        len(sample_df),
         total_calls_estimate,
     )
 
-    for level_idx, n in enumerate(NOISE_LEVELS, start=1):
-        logger.info("=== Level %.1f (%d/%d) ===", n, level_idx, len(NOISE_LEVELS))
-        level_indices = indices_by_level.get(round(n, 1)) if indices_by_level else None
+    for block_idx, (n, method_key) in enumerate(todo, start=1):
+        label = POLICY_LABELS[method_key]
+        logger.info("--- %s at level %.1f (block %d/%d) ---", label, n, block_idx, len(todo))
 
-        for policy_idx, method_key in enumerate(policies, start=1):
-            label = POLICY_LABELS[method_key]
-            logger.info(
-                "--- %s (policy %d/%d) at level %.1f ---",
-                label,
-                policy_idx,
-                len(policies),
-                n,
-            )
+        degraded_df = apply_deletion(sample_df, n, method_key)
+        acc, records_df = evaluate(
+            degraded_df,
+            classifier,
+            tracker=tracker,
+            context=f"level={n:.1f} | {label}",
+            orig_lengths=orig_lengths,
+        )
+        records_df["level"] = n
+        records_df["policy"] = method_key
+        records_df["policy_label"] = label
+        records_df["version"] = EXPERIMENT_VERSION
+        all_records.append(records_df)
 
-            degraded_df = apply_deletion(test_df, n, method_key)
-            acc, records_df = evaluate(
-                degraded_df,
-                classifier,
-                SAMPLE_SIZE,
-                tracker=tracker,
-                context=f"level={n:.1f} | {label}",
-                orig_lengths=orig_lengths,
-                indices=level_indices,
-            )
-            records_df["level"] = n
-            records_df["policy"] = method_key
-            records_df["policy_label"] = label
-            all_records.append(records_df)
-
-            logger.info("%s @ level %.1f -> accuracy=%.4f", label, n, acc)
+        logger.info("%s @ level %.1f -> accuracy=%.4f", label, n, acc)
+        if on_block_done:
+            on_block_done(pd.concat(all_records, ignore_index=True))
 
     logger.info("Experiment complete in %s", format_duration(time.monotonic() - tracker.start_time))
-    return pd.concat(all_records, ignore_index=True) if all_records else pd.DataFrame()
+    return pd.concat(all_records, ignore_index=True)
 
 
 def build_experiment_results(master_records: pd.DataFrame) -> ExperimentResults:
@@ -730,7 +794,7 @@ def main() -> None:
 
     load_dotenv()  # pick up OPENAI_API_KEY from a local .env file, if present
     api_key = os.environ.get("OPENAI_API_KEY")
-    client = OpenAI(api_key=api_key) if api_key else None
+    client = OpenAI(api_key=api_key, max_retries=MAX_API_RETRIES) if api_key else None
 
     logger.info("Loading dataset")
     dataset = load_dataset("stanfordnlp/imdb")
@@ -740,46 +804,37 @@ def main() -> None:
     orig_lengths = compute_token_lengths(test_df["text"])
     write_dataset_summary(test_df, orig_lengths)
 
-    # If a previous run already saved data/run_records.csv, reuse its exact
-    # per-level review sample and skip any policy that's already in it --
-    # so adding a new policy only costs API calls for that new policy.
+    # One fixed sample of reviews, shared by every level and policy.
+    sample_df = test_df.sample(n=SAMPLE_SIZE, random_state=RANDOM_SEED)
+
+    # Resume from data/run_records.csv if a previous run (or an interrupted
+    # one) already recorded some level/policy blocks under this version.
     run_records_path = os.path.join(DATA_DIR, "run_records.csv")
     existing_records: pd.DataFrame | None = None
-    existing_policies: set[str] = set()
-    indices_by_level: dict[float, list] | None = None
-
     if os.path.exists(run_records_path):
-        logger.info("Found existing %s -- reusing its samples where possible", run_records_path)
         existing_records = pd.read_csv(run_records_path)
-        existing_policies = set(existing_records["policy"].unique())
-        indices_by_level = {
-            round(float(level), 1): group["index"].unique().tolist()
-            for level, group in existing_records.groupby("level")
-        }
-        logger.info("Policies already present: %s", sorted(existing_policies))
+        versions = set(existing_records.get("version", pd.Series([1])).fillna(1).astype(int))
+        if versions != {EXPERIMENT_VERSION}:
+            raise RuntimeError(
+                f"{run_records_path} holds records from experiment version(s) {sorted(versions)}, "
+                f"but this code is version {EXPERIMENT_VERSION}. Move or delete that file so "
+                "results from different code versions are not mixed."
+            )
+        if set(existing_records["index"]) != set(sample_df.index):
+            raise RuntimeError(f"{run_records_path} was recorded on a different review sample.")
+        logger.info("Found existing %s -- resuming from its recorded blocks", run_records_path)
 
-    remaining_policies = [k for k in DELETION_METHODS if k not in existing_policies]
+    todo = len(NOISE_LEVELS) * len(DELETION_METHODS) - len(completed_blocks(existing_records))
+    if todo and client is None:
+        raise RuntimeError("Set OPENAI_API_KEY in .env (see .env.example) before running.")
 
-    if remaining_policies:
-        logger.info("Policies to run this session: %s", remaining_policies)
-        if client is None:
-            raise RuntimeError("Set OPENAI_API_KEY in .env (see .env.example) before running.")
-        classifier = SentimentClassifier(client)
-        new_records = run_experiment(
-            test_df,
-            classifier,
-            orig_lengths,
-            policies=remaining_policies,
-            indices_by_level=indices_by_level,
-        )
-        master_records = (
-            pd.concat([existing_records, new_records], ignore_index=True)
-            if existing_records is not None
-            else new_records
-        )
-    else:
-        logger.info("All policies already present in %s -- skipping API calls entirely", run_records_path)
-        master_records = existing_records
+    master_records = run_experiment(
+        sample_df,
+        SentimentClassifier(client),
+        orig_lengths,
+        existing_records=existing_records,
+        on_block_done=save_run_data,  # checkpoint after every block
+    )
 
     results = build_experiment_results(master_records)
 
