@@ -52,6 +52,7 @@ Per-severity plots of accuracy against original review length are in [`results/p
 ```
 ├── run_experiment.py        # full pipeline: deletion policies, LLM classification, plots
 ├── requirements.txt
+├── .env.example             # template for your local .env (API key)
 ├── paper/
 │   └── research_draft.pdf   # current paper draft
 ├── data/
@@ -74,10 +75,10 @@ python run_experiment.py
 
 The script reuses `data/run_records.csv`. It only calls the API for policies not already recorded there, using the same review sample. With the committed data, every policy is already present, so the command regenerates all tables and plots **without an API key or any API calls**.
 
-To run a new policy, add it to `DELETION_METHODS` / `POLICY_LABELS` and set your key first:
+To run a new policy, add it to `DELETION_METHODS` / `POLICY_LABELS` and put your key in a local `.env` file. The `.env` file is gitignored, so it is never committed.
 
 ```bash
-export OPENAI_API_KEY=...   # never commit this
+cp .env.example .env   # then set OPENAI_API_KEY=sk-... in .env
 python run_experiment.py
 ```
 

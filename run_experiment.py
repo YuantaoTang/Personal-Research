@@ -51,6 +51,7 @@ import numpy as np
 import pandas as pd
 import tiktoken
 from datasets import load_dataset
+from dotenv import load_dotenv
 from openai import OpenAI
 from sklearn.metrics import accuracy_score
 
@@ -727,6 +728,7 @@ def main() -> None:
     logger.info("Using Python executable: %s", sys.executable)
     np.random.seed(RANDOM_SEED)
 
+    load_dotenv()  # pick up OPENAI_API_KEY from a local .env file, if present
     api_key = os.environ.get("OPENAI_API_KEY")
     client = OpenAI(api_key=api_key) if api_key else None
 
@@ -761,7 +763,7 @@ def main() -> None:
     if remaining_policies:
         logger.info("Policies to run this session: %s", remaining_policies)
         if client is None:
-            raise RuntimeError("Set the OPENAI_API_KEY environment variable before running.")
+            raise RuntimeError("Set OPENAI_API_KEY in .env (see .env.example) before running.")
         classifier = SentimentClassifier(client)
         new_records = run_experiment(
             test_df,
