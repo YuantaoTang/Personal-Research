@@ -1,0 +1,13 @@
+IMDB Test Set Summary
+==============================
+
+Total reviews:    25000
+Positive reviews: 12500 (50.0%)
+Negative reviews: 12500 (50.0%)
+
+Review length, in GPT tokens (original text, before any deletion):
+  Mean:    285.43
+  Median:  213.50
+  Std Dev: 213.53
+  Min:     8
+  Max:     2883
