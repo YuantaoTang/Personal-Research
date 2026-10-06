@@ -57,6 +57,7 @@ import logging
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 import matplotlib.pyplot as plt
@@ -92,7 +93,8 @@ from policies import (
 EXPERIMENT_VERSION = 3
 
 TEMPERATURE = 0.0
-MAX_API_RETRIES = 5
+MAX_API_RETRIES = 5        # per request; the client backs off on rate-limit errors
+DEFAULT_WORKERS = 8        # concurrent API requests; override with --workers
 SAMPLE_SIZE = 500    # reviews per split
 NOISE_LEVELS = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
 PROGRESS_LOG_EVERY = 50  # log a progress line every N samples within a block
@@ -225,9 +227,48 @@ class SentimentClassifier:
         self.on_call = on_call  # invoked once per real (non-cached) API call
 
     def classify(self, text: str) -> str:
-        if text in self._cache:
-            return self._cache[text]
+        if text not in self._cache:
+            self._cache[text] = self._request(text)
+            if self.on_call:
+                self.on_call()
+        return self._cache[text]
 
+    def classify_many(
+        self,
+        texts: list[str],
+        workers: int = 1,
+        on_progress: Callable[[int], None] | None = None,
+    ) -> list[str]:
+        """
+        Classify `texts`, sending up to `workers` uncached requests at once.
+        Results are identical to calling classify() on each text in turn;
+        `on_progress(done)` is called after each text is resolved.
+        """
+        done = sum(t in self._cache for t in texts)  # already answered
+        pending = [t for t in dict.fromkeys(texts) if t not in self._cache]
+        if pending:
+            pool = ThreadPoolExecutor(max_workers=max(1, workers))
+            try:
+                # map() yields results in input order as they complete, so the
+                # cache and progress updates all happen on this thread.
+                for text, result in zip(pending, pool.map(self._request, pending)):
+                    self._cache[text] = result
+                    if self.on_call:
+                        self.on_call()
+                    done += texts.count(text)
+                    if on_progress:
+                        on_progress(done)
+            except BaseException:
+                # Error or Ctrl+C: stop queued requests instead of finishing the block.
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            pool.shutdown()
+        elif on_progress:
+            on_progress(done)
+        return [self._cache[t] for t in texts]
+
+    def _request(self, text: str) -> str:
+        """One API call (thread-safe; the OpenAI client may be shared)."""
         prompt = (
             "Classify this movie review as Positive or Negative.\n\n"
             f"Review: {text}\n\n"
@@ -240,13 +281,7 @@ class SentimentClassifier:
             max_tokens=5,
             temperature=TEMPERATURE,
         )
-
-        if self.on_call:
-            self.on_call()
-
-        result = (response.choices[0].message.content or "").strip()
-        self._cache[text] = result
-        return result
+        return (response.choices[0].message.content or "").strip()
 
     @staticmethod
     def label_to_int(output: str) -> int:
@@ -266,16 +301,30 @@ def evaluate_block(
     classifier: SentimentClassifier,
     tracker: ProgressTracker | None = None,
     context: str = "",
+    workers: int = 1,
 ) -> tuple[float, pd.DataFrame]:
     """
-    Degrade every review at level `n` under `priority`, classify it, and return
-    (accuracy, records). Unparsable model outputs are excluded from the
-    accuracy and recorded with pred_label=-1 and correct=NaN.
+    Degrade every review at level `n` under `priority`, classify it (up to
+    `workers` requests at once), and return (accuracy, records). Unparsable
+    model outputs are excluded from the accuracy and recorded with
+    pred_label=-1 and correct=NaN.
     """
+    degraded = [apply_policy(review, n, priority) for review in reviews.values()]
+    texts = [text for text, _ in degraded]
+
+    logged = 0
+
+    def log_progress(done: int) -> None:
+        nonlocal logged
+        if tracker and (done // PROGRESS_LOG_EVERY > logged // PROGRESS_LOG_EVERY or done == len(texts)):
+            tracker.log_progress(context=f"{context} | {done}/{len(texts)} samples")
+        logged = done
+
+    outputs = classifier.classify_many(texts, workers=workers, on_progress=log_progress)
+
     records = []
-    for i, (idx, review) in enumerate(reviews.items(), start=1):
-        text, keep = apply_policy(review, n, priority)
-        pred_label = classifier.label_to_int(classifier.classify(text))
+    for (idx, review), (text, keep), output in zip(reviews.items(), degraded, outputs):
+        pred_label = classifier.label_to_int(output)
         true_label = int(labels.loc[idx])
         records.append(
             {
@@ -288,8 +337,6 @@ def evaluate_block(
                 "kept_mask": encode_mask(keep),
             }
         )
-        if tracker and (i % PROGRESS_LOG_EVERY == 0 or i == len(reviews)):
-            tracker.log_progress(context=f"{context} | {i}/{len(reviews)} samples")
 
     records_df = pd.DataFrame(records)
     return records_df["correct"].mean(), records_df
@@ -314,6 +361,7 @@ def run_experiment(
     classifier: SentimentClassifier,
     existing_records: pd.DataFrame | None = None,
     on_block_done: Callable[[pd.DataFrame], None] | None = None,
+    workers: int = 1,
 ) -> pd.DataFrame:
     """
     For each level n in NOISE_LEVELS and each policy, degrade every review and
@@ -355,7 +403,14 @@ def run_experiment(
         logger.info("--- %s at level %.1f (block %d/%d) ---", label, n, block_idx, len(todo))
 
         acc, records_df = evaluate_block(
-            reviews, labels, n, priority, classifier, tracker=tracker, context=f"level={n:.1f} | {label}"
+            reviews,
+            labels,
+            n,
+            priority,
+            classifier,
+            tracker=tracker,
+            context=f"level={n:.1f} | {label}",
+            workers=workers,
         )
         records_df["level"] = n
         records_df["policy"] = key
@@ -513,6 +568,12 @@ def load_split(split: str) -> tuple[pd.DataFrame, dict[int, ReviewTokens]]:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--split", choices=SPLITS, default="train", help="review sample to run on")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"concurrent API requests (default {DEFAULT_WORKERS}; lower it if you hit rate limits)",
+    )
     args = parser.parse_args(argv)
     split = args.split
 
@@ -556,6 +617,7 @@ def main(argv: list[str] | None = None) -> None:
         SentimentClassifier(client),
         existing_records=existing_records,
         on_block_done=lambda r: save_records(r, path),  # checkpoint after every block
+        workers=args.workers,
     )
     save_records(records, path)
 
