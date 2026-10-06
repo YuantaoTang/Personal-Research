@@ -73,6 +73,7 @@ from run_experiment import (
     learned_policy_key,
     load_split,
     read_records,
+    completed_blocks,
     records_path,
 )
 
@@ -169,8 +170,26 @@ def predicted_accuracy(
 # fit
 # --------------------------------------------------------------------------- #
 
+def require_complete(records: pd.DataFrame, policies: list[str], split: str) -> None:
+    """Refuse to work from a partial run: the missing blocks are usually the
+    high deletion levels, where nearly all of the signal is."""
+    missing = sorted(
+        (n, key) for n in NOISE_LEVELS for key in policies if (round(n, 1), key) not in completed_blocks(records)
+    )
+    if missing:
+        raise RuntimeError(
+            f"data/{split}_records.csv is incomplete: {len(missing)} of "
+            f"{len(NOISE_LEVELS) * len(policies)} level/policy blocks missing (first: level "
+            f"{missing[0][0]:.1f}, {missing[0][1]}). Rerun `python run_experiment.py --split {split}` "
+            "to finish it; it resumes where it stopped."
+        )
+
+
 def fit() -> None:
     records = load_records("train")
+    # Check the raw file: load_records drops unparsable answers, which would
+    # make a finished block look short.
+    require_complete(read_records(records_path("train")), list(BASELINE_POLICIES), "train")
     _, reviews = load_split("train")
     y = records["correct"].astype(int).to_numpy()
     groups = records["index"].to_numpy()
